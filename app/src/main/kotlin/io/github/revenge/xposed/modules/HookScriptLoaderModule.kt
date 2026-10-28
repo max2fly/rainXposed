@@ -95,6 +95,26 @@ object HookScriptLoaderModule : Module() {
     private fun HookScope.runCustomScripts(loadScriptFromFile: Method, loadScriptFromAssets: Method) {
         Log.i("Running custom scripts...")
 
+        // Read the running Discord bundle's Hermes bytecode version from its header so the
+        // updater can fetch the matching rain.<v>.hbc. Authoritative (LibUnbound misreports).
+        readDeviceBytecodeVersion()?.let {
+            Log.i("Discord bundle Hermes bytecode version (from header): $it")
+            UpdaterModule.deviceBytecodeVersion = it
+        }
+
+        // Self-heal: if a cached bundle was built for a different Hermes version (e.g. left
+        // over from before a Discord update), delete it so the correct one is re-downloaded,
+        // instead of loading it and crashing the runtime with a bytecode-version mismatch.
+        UpdaterModule.deviceBytecodeVersion?.let { deviceVer ->
+            if (mainScript.exists()) {
+                val cachedVer = runCatching { readBytecodeVersion(mainScript.inputStream()) }.getOrNull()
+                if (cachedVer != null && cachedVer != deviceVer) {
+                    Log.i("Cached bundle is v$cachedVer but device needs v$deviceVer — deleting stale cache")
+                    mainScript.delete()
+                }
+            }
+        }
+
         runBlocking {
             val ready = async { HookStateHolder.readyDeferred.join() }
             val isCustomUrl = UpdaterModule.isCustomUrlEnabled
@@ -155,6 +175,40 @@ object HookScriptLoaderModule : Module() {
             }
         } catch (e: Throwable) {
             Log.e("Unable to run scripts:", e)
+        }
+    }
+
+    /**
+     * Reads the Hermes bytecode version from the header of the bundle currently being loaded
+     * (Discord's own assets://index.android.bundle). Returns null if this hook invocation isn't
+     * an AssetManager load or the data isn't a Hermes bytecode file.
+     *
+     * Hermes header: magic uint64 0x1F1903C103BC1FC6 (little-endian) then uint32 version at offset 8.
+     */
+    private fun HookScope.readDeviceBytecodeVersion(): Int? {
+        val assetManager = args.getOrNull(0) as? AssetManager ?: return null
+        val assetPath = (args.getOrNull(1) as? String)?.substringAfter("assets://")?.takeIf { it.isNotEmpty() }
+            ?: return null
+        return runCatching { readBytecodeVersion(assetManager.open(assetPath)) }.getOrNull()
+    }
+
+    /** Reads the Hermes bytecode version from a stream's header, or null if not Hermes bytecode. */
+    private fun readBytecodeVersion(input: java.io.InputStream): Int? = input.use {
+        val header = ByteArray(12)
+        var read = 0
+        while (read < header.size) {
+            val n = it.read(header, read, header.size - read)
+            if (n < 0) break
+            read += n
+        }
+        when {
+            read < header.size -> null
+            // Hermes magic little-endian starts with C6 1F ...
+            (header[0].toInt() and 0xFF) != 0xC6 || (header[1].toInt() and 0xFF) != 0x1F -> null
+            else -> (header[8].toInt() and 0xFF) or
+                ((header[9].toInt() and 0xFF) shl 8) or
+                ((header[10].toInt() and 0xFF) shl 16) or
+                ((header[11].toInt() and 0xFF) shl 24)
         }
     }
 }

@@ -37,6 +37,11 @@ data class LoaderConfig(val customLoadUrl: CustomLoadUrl = CustomLoadUrl(), val 
 data class EndpointInfo(val paths: ArrayList<String>, val hash: String? = null, val version: String)
 
 object UpdaterModule : Module() {
+    // Real Hermes bytecode version of the running Discord build, read from its own bundle
+    // header by HookScriptLoaderModule. Authoritative — unlike LibUnbound, which misreports.
+    @Volatile
+    var deviceBytecodeVersion: Int? = null
+
     private lateinit var config: LoaderConfig
     val isCustomUrlEnabled: Boolean
         get() = config.customLoadUrl.enabled
@@ -165,22 +170,30 @@ object UpdaterModule : Module() {
             return config.customLoadUrl.url
         }
 
+        val libunboundVersion = withTimeoutOrNull(2000L) {
+            runCatching { LibUnbound.getHermesRuntimeBytecodeVersion() }.getOrNull()
+        }
+        // Prefer the version read from Discord's own bundle header (authoritative); only fall
+        // back to LibUnbound (known to misreport on some builds) or 96 if that wasn't available.
+        val hermesVersion = deviceBytecodeVersion ?: libunboundVersion ?: 96
+        Log.i("Hermes bytecode version: using=$hermesVersion (bundleHeader=$deviceBytecodeVersion, libunbound=$libunboundVersion)")
+        val hbcName = "rain.$hermesVersion.hbc"
+
         return try {
-            val infoResponse = client.get("${DEFAULT_BASE_URL}info.json")
-            if (infoResponse.status == HttpStatusCode.OK) {
-                val info = JSON.decodeFromString<EndpointInfo>(infoResponse.bodyAsText())
-                val hermesVersion = withTimeoutOrNull(2000L) {
-                    runCatching { LibUnbound.getHermesRuntimeBytecodeVersion() }.getOrNull()
-                } ?: 96
-                
-                val hbcName = "rain.$hermesVersion.hbc"
-                when {
-                    info.paths.contains(hbcName) -> DEFAULT_BASE_URL + hbcName
-                    info.paths.contains("rain.min.js") -> DEFAULT_BASE_URL + "rain.min.js"
-                    else -> DEFAULT_BASE_URL + DEFAULT_BUNDLE_NAME
-                }
-            } else DEFAULT_BASE_URL + DEFAULT_BUNDLE_NAME
+            // Always use the LATEST release (newest rain code). Prefer a prebuilt .hbc matching
+            // THIS device's Hermes version (instant load). Otherwise use the latest rain.js —
+            // Hermes compiles it on-device to the right bytecode version, which is how rain runs
+            // on older Discord builds (e.g. 331.14 = v96) whose latest release ships no matching
+            // .hbc. Match by basename since info.paths entries look like "dist/rain.98.hbc".
+            val info = JSON.decodeFromString<EndpointInfo>(client.get("${DEFAULT_BASE_URL}info.json").bodyAsText())
+            fun has(name: String) = info.paths.any { it.substringAfterLast('/') == name }
+            when {
+                has(hbcName) -> DEFAULT_BASE_URL + hbcName
+                has("rain.min.js") -> DEFAULT_BASE_URL + "rain.min.js"
+                else -> DEFAULT_BASE_URL + DEFAULT_BUNDLE_NAME
+            }
         } catch (e: Exception) {
+            Log.e("Failed to resolve bundle URL, falling back to latest rain.js", e)
             DEFAULT_BASE_URL + DEFAULT_BUNDLE_NAME
         }
     }
